@@ -61,6 +61,13 @@ async function build(modelId: string, backend: Backend): Promise<Loaded> {
   const transcriber = (await pipeline('automatic-speech-recognition', spec.repo, {
     device: backend,
     dtype: spec.dtype[backend],
+    // ONNX Runtime's extended graph optimizations crash on the quantized
+    // Whisper decoders ("TransposeDQWeightsForMatMulNBits Missing required
+    // scale ..."), which makes every quantized model fail to load. The
+    // transform runs above the basic level, so capping it there sidesteps the
+    // bug; the basic passes still do constant folding and redundant-node
+    // elimination.
+    session_options: { graphOptimizationLevel: 'basic' },
     progress_callback: (item: unknown) => {
       const p = item as { status?: string; file?: string; loaded?: number; total?: number; progress?: number };
       if (p.status === 'progress' && p.file) {

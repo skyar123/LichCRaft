@@ -13,8 +13,24 @@ const PORT = Number(process.env.PORT ?? 4319);
 const ORIGIN = `http://localhost:${PORT}`;
 const FIXTURE_DIR = join(process.cwd(), '.fixtures');
 const FIXTURE = join(FIXTURE_DIR, 'jfk.wav');
+const MODEL_DIR = join(FIXTURE_DIR, 'model');
 const CLIP_URL =
   'https://huggingface.co/datasets/Xenova/transformers.js-docs/resolve/main/jfk.wav';
+
+// The test serves the model from disk rather than the network. That keeps the
+// run hermetic and repeatable, and it means a CI box behind a restrictive
+// egress proxy still exercises the whole pipeline: decode, ONNX Runtime, and
+// Whisper itself. Downloading from Hugging Face is the one step it skips.
+const MODEL_REPO = 'Xenova/whisper-tiny.en';
+const MODEL_FILES = [
+  'config.json',
+  'preprocessor_config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'generation_config.json',
+  'onnx/encoder_model_quantized.onnx',
+  'onnx/decoder_model_merged_quantized.onnx',
+];
 // The clip is JFK's inaugural address; these words must survive transcription.
 const EXPECTED = ['fellow', 'americans', 'country'];
 
@@ -50,8 +66,68 @@ function startPreview() {
   });
 }
 
+async function ensureModelFixture() {
+  await mkdir(join(MODEL_DIR, 'onnx'), { recursive: true });
+  for (const name of MODEL_FILES) {
+    const target = join(MODEL_DIR, name);
+    try {
+      await access(target);
+      continue;
+    } catch {
+      /* not cached yet */
+    }
+    console.log(`· downloading ${name}`);
+    const res = await fetch(`https://huggingface.co/${MODEL_REPO}/resolve/main/${name}`);
+    if (!res.ok) throw new Error(`Could not fetch ${name}: ${res.status}`);
+    await writeFile(target, Buffer.from(await res.arrayBuffer()));
+  }
+}
+
+/**
+ * Serve any huggingface.co request for this model out of MODEL_DIR. Routing is
+ * installed on the browser context, not the page: the model is fetched from
+ * inside a Web Worker, whose requests page-level routing does not see.
+ */
+async function serveModelLocally(page, onRequest) {
+  await page.context().route('https://huggingface.co/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    onRequest(path);
+    const match = MODEL_FILES.find((name) => path.endsWith(`/${name}`));
+    if (!match) return route.fulfill({ status: 404, body: 'not a fixture' });
+    const body = await readFile(join(MODEL_DIR, match));
+    await route.fulfill({
+      status: 200,
+      contentType: match.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+      headers: { 'Access-Control-Allow-Origin': '*' },
+      body,
+    });
+  });
+}
+
+/**
+ * Waits for a status element to satisfy `done`, but gives up immediately if the
+ * app puts something in its error banner — otherwise a failure just looks like
+ * a timeout, which says nothing about the cause.
+ */
+async function waitForStatusOrError(page, selector, done, timeout, what) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const [status, error] = await Promise.all([
+      page.textContent(selector),
+      page.textContent('#error'),
+    ]);
+    if (error?.trim()) throw new Error(`app reported an error during ${what}: ${error.trim()}`);
+    if (status && done(status.trim())) return;
+    if (Date.now() > deadline) {
+      throw new Error(`timed out waiting for ${what} (last status: "${status?.trim()}")`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 async function main() {
   await ensureFixture();
+  await ensureModelFixture();
   const server = await startPreview();
   // Honour a pre-provisioned Chromium (CI images often pin one that does not
   // match the npm package's expected build number).
@@ -79,6 +155,8 @@ async function main() {
       const host = new URL(req.url()).host;
       if (host !== `localhost:${PORT}`) externalHosts.add(host);
     });
+    const servedFromFixture = [];
+    await serveModelLocally(page, (path) => servedFromFixture.push(path));
     page.on('console', (msg) => {
       if (msg.type() === 'error') console.log('  [browser error]', msg.text());
     });
@@ -88,10 +166,12 @@ async function main() {
     console.log('· loading tiny.en');
     await page.selectOption('#modelSelect', 'tiny.en');
     await page.click('#loadBtn');
-    await page.waitForFunction(
-      () => document.getElementById('loadStatus')?.textContent?.includes('ready'),
-      null,
-      { timeout: 300_000 },
+    await waitForStatusOrError(
+      page,
+      '#loadStatus',
+      (text) => text.includes('ready'),
+      120_000,
+      'model load',
     );
 
     console.log('· decoding audio (stereo 44.1kHz -> mono 16kHz)');
@@ -102,10 +182,12 @@ async function main() {
 
     console.log('· transcribing');
     await page.click('#runBtn');
-    await page.waitForFunction(
-      () => document.getElementById('runStatus')?.textContent === 'Done.',
-      null,
-      { timeout: 300_000 },
+    await waitForStatusOrError(
+      page,
+      '#runStatus',
+      (text) => text === 'Done.',
+      300_000,
+      'transcription',
     );
 
     const text = (await page.inputValue('#output')).toLowerCase();
@@ -137,6 +219,7 @@ async function main() {
     const unexpected = [...externalHosts].filter(
       (host) => !/(^|\.)huggingface\.co$|(^|\.)hf\.co$/.test(host),
     );
+    console.log(`· model files served from fixtures: ${servedFromFixture.length}`);
     console.log(`· external hosts contacted: ${[...externalHosts].join(', ') || 'none'}`);
     if (unexpected.length) {
       throw new Error(`unexpected third-party requests: ${unexpected.join(', ')}`);

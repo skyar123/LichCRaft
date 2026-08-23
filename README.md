@@ -53,7 +53,10 @@ npm run typecheck   # tsc --noEmit
 npm run test:e2e    # real browser: loads a model, transcribes a known clip
 ```
 
-The smoke test downloads the Tiny model (~38 MB) on first run, so give it a few minutes.
+The smoke test caches the Tiny model (~38 MB) under `.fixtures/` on first run, then serves it
+to the browser from disk. That keeps the run hermetic and repeatable, and lets it pass on a CI
+box behind a restrictive egress proxy — the full pipeline (decode, ONNX Runtime, Whisper,
+export) is still exercised; only the Hugging Face download itself is stubbed.
 
 - `CHROMIUM_PATH` — use a pre-provisioned Chromium instead of the one Playwright downloads.
 - `HTTPS_PROXY` — if set, the test routes the browser through it and accepts its certificate,
@@ -72,6 +75,15 @@ Cross-Origin-Embedder-Policy: credentialless
 
 These enable cross-origin isolation, which lets the CPU backend use multi-threaded WASM. The app
 still runs without them, just slower.
+
+## Known workaround
+
+ONNX Runtime's *extended* graph optimizations crash on the quantized Whisper decoders with
+`TransposeDQWeightsForMatMulNBits Missing required scale ...`, which makes every quantized model
+fail to load. This affects the `Xenova` and `onnx-community` exports alike, so it is a runtime
+bug rather than a bad conversion. The app caps the optimization level at `basic`, which skips
+the offending transform while keeping constant folding and redundant-node elimination. See
+`session_options` in `src/worker.ts`.
 
 ## Which model should I pick?
 
