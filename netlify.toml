@@ -1,0 +1,33 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# Cross-origin isolation lets onnxruntime-web use multi-threaded WASM, which is
+# a large speedup on the CPU backend. Mirrors public/_headers so the setting
+# survives whichever path Netlify uses.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "credentialless"
+
+# The ONNX Runtime binaries are content-stable and large; let the browser keep
+# them. Model weights are cached separately by the service worker.
+[[headers]]
+  for = "/ort/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Single-page app: the service worker handles routing once installed.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
