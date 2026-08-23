@@ -5,3 +5,7 @@ dev-dist/
 *.local
 .vite/
 .fixtures/
+
+# Netlify CLI local state and upload artifact
+.netlify/
+deploy-*.zip
